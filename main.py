@@ -17,6 +17,9 @@ from tabulate import tabulate
 import requests
 import feedparser
 
+import smtplib
+from email.mime.text import MIMEText
+
 # from joblib import Memory
 # memory = Memory('.joblibcache', verbose=0)
 
@@ -26,6 +29,7 @@ logging.getLogger("urllib3").setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
 CITY = "Lund"
+APARTMENTS_ONLY = True
 
 malmo_c_coords = (55.6091, 12.9999)
 triangeln_coords = (55.5944, 13.0004)
@@ -37,6 +41,7 @@ DOWNPAYMENT = 1_050_000
 LOAN_FACTOR = None  # 0.7
 INTEREST = 0.015
 OPPORTUNITY_COC_RATE = 0.00
+
 
 
 class Datastore:
@@ -105,7 +110,7 @@ class Property:
 
     @staticmethod
     def headers() -> List[str]:
-        return ["address", "price", "area", "fee", "rooms", "cst/mo", "cst/m²/mo", "dist", "dir", "publ"]
+        return ["address", "price", "area", "fee", "rooms", "cst/mo", "cst/m²/mo", "dist", "dir", "publ", "link"]
 
     def row(self) -> List[Any]:
         attractors = cities[CITY]["attractors"]
@@ -123,6 +128,7 @@ class Property:
             dist,
             direction,
             f"{str(self.time_since_published().days) + 'd ago' if self.time_since_published() else ''}",
+            self.link
         ]
 
     def monthly_cost_per_sqm(self) -> float:
@@ -236,6 +242,7 @@ def _crawl_hemnet():
 def _crawl_afb():
     r = requests.get("https://www.afbostader.se/redimo/rest/vacantproducts")
     data = r.json()['product']
+    new_props = []
     for a in data:
         p = Property(link=f"https://www.afbostader.se/lediga-bostader/bostadsdetalj/?obj={a['productId']}&area={a['area']}",
                      address=a['address'],
@@ -244,11 +251,53 @@ def _crawl_afb():
                      rooms=1 if a['shortDescription'] == 'Korridorrum' else float(a['shortDescription'].split()[0].replace(",", ".")),
                      price=0,
                      published=datetime(*map(int, a['reserveFromDate'].split("-"))))
-        db.data[p.link]['property'] = p
+        if (APARTMENTS_ONLY and a['shortDescription'] != 'Korridorrum') or not APARTMENTS_ONLY:
+            if p.link not in db.data:
+                new_props.append(p)
+            db.data[p.link]['property'] = p
+    if not new_props:
+        cprint(f"No new shit dawg", Fore.YELLOW)
+    else:
+        process_new(new_props)
 
+def process_new(props):
+    def size(p: Property):
+        return p.rooms >= 3
+
+    props = [p for p in props if size(p)]
+
+    if not props:
+        cprint(f"New properties, but none satisfying requirements", Fore.YELLOW)
+    else:
+        message = tabulate([p.row() for p in props], headers=Property.headers(), floatfmt=(None, '.0f'))
+        send_email(message)
+
+
+def send_email(body):
+    gmail_user = 'you@gmail.com'  
+    gmail_password = 'password'
+
+    sent_from = gmail_user  
+    to = ['first@gmail.com', 'second@gmail.com']  
+    subject = 'Ny lägenhet hos AFB'  
+
+    msg = MIMEText(body, 'plain')
+    msg['Subject']= subject
+    msg['From']   = sent_from
+
+    try:  
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.ehlo()
+        server.login(gmail_user, gmail_password)
+        server.sendmail(sent_from, to, msg.as_string())
+        server.close()
+
+        print('Email sent!')
+    except smtplib.SMTPException as e:
+        print(str(e)) 
 
 def crawl():
-    _crawl_hemnet()
+    #_crawl_hemnet()
     _crawl_afb()
 
 
@@ -279,6 +328,7 @@ def filter_unwanted(props):
 
 
 def main() -> None:
+    
     cprint(f"Looking for apartments in {CITY}", Fore.GREEN)
     crawl()
     db.save()
@@ -289,9 +339,9 @@ def main() -> None:
     assign_coords(props)
     db.save()
 
-    props = filter_unwanted(props)[-30:]
+    #props = filter_unwanted(props)[-30:]
     # If you want to see AFB apartments, use this filtering instead.
-    # props = filter(lambda p: p.price == 0, props)
+    props = filter(lambda p: p.price == 0, props)
     props = sorted(props, key=lambda p: p.published)
 
     cprint(f"Assumptions:\n - Downpayment or loan factor: {LOAN_FACTOR or DOWNPAYMENT}\n - Interest: {INTEREST*100}%\n - Opportunity cost of capital: {OPPORTUNITY_COC_RATE*100}%", Fore.GREEN)
